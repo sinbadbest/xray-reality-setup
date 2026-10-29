@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# 新服务器一键部署 xray 出口（VLESS + Reality + vision），Debian 12/13，root 运行。
+# 新服务器一键部署 xray 出口（VLESS + Reality + vision），root 运行。
+# 支持：Debian / Ubuntu（apt），Rocky / AlmaLinux / CentOS Stream / RHEL 8+（dnf），需要 systemd。
 # 用法：bash <(curl -Ls https://raw.githubusercontent.com/sinbadbest/xray-reality-setup/main/install.sh)
 #       PORT=36703 SNI=www.ebay.com EXTRA_IGNORE="1.2.3.4" bash <(curl -Ls ...)
 # 重复运行安全：已有配置时沿用原 UUID/密钥/shortId，客户端不用改。
@@ -11,9 +12,19 @@ EXTRA_IGNORE=${EXTRA_IGNORE:-}   # fail2ban 额外白名单，空格分隔（如
 CFG=/usr/local/etc/xray/config.json
 XRAY=/usr/local/bin/xray
 
-[[ $EUID -eq 0 ]] || { echo "请用 root 运行" >&2; exit 1; }
-grep -qi debian /etc/os-release || { echo "仅支持 Debian" >&2; exit 1; }
-if ! [[ $PORT =~ ^[0-9]+$ ]] || (( PORT < 1 || PORT > 65535 )); then echo "PORT 无效：$PORT" >&2; exit 1; fi
+die() { echo "$*" >&2; exit 1; }
+[[ $EUID -eq 0 ]] || die "请用 root 运行"
+[[ -d /run/systemd/system ]] || die "需要 systemd"
+# shellcheck source=/dev/null
+. /etc/os-release
+if command -v apt-get >/dev/null; then
+  OS=deb
+elif command -v dnf >/dev/null && [[ " ${ID_LIKE:-} $ID " =~ [[:space:]](rhel|centos)[[:space:]] ]]; then
+  OS=rhel
+else
+  die "不支持的系统：${PRETTY_NAME:-未知}（支持 Debian/Ubuntu 和 RHEL 系 8+）"
+fi
+if ! [[ $PORT =~ ^[0-9]+$ ]] || (( PORT < 1 || PORT > 65535 )); then die "PORT 无效：$PORT"; fi
 
 echo "== 1/7 swap"
 if [[ -z $(swapon --show) ]] && (( $(awk '/MemTotal/{print $2}' /proc/meminfo) < 2000000 )); then
@@ -21,18 +32,27 @@ if [[ -z $(swapon --show) ]] && (( $(awk '/MemTotal/{print $2}' /proc/meminfo) <
   grep -q '^/swapfile' /etc/fstab || echo '/swapfile swap swap defaults 0 0' >> /etc/fstab
 fi
 
-echo "== 2/7 软件包"
-export DEBIAN_FRONTEND=noninteractive
-# 新开机器的 unattended-upgrades 常占着 dpkg 锁，等它而不是直接失败
-APT=(apt-get -o DPkg::Lock::Timeout=600)
-"${APT[@]}" update -q
-"${APT[@]}" install -yq curl jq openssl ufw fail2ban python3-systemd unattended-upgrades
-printf 'APT::Periodic::Update-Package-Lists "1";\nAPT::Periodic::Unattended-Upgrade "1";\n' \
-  > /etc/apt/apt.conf.d/20auto-upgrades
+echo "== 2/7 软件包与自动安全更新（${PRETTY_NAME:-$ID}）"
+if [[ $OS == deb ]]; then
+  export DEBIAN_FRONTEND=noninteractive
+  # 新开机器的 unattended-upgrades 常占着 dpkg 锁，等它而不是直接失败
+  APT=(apt-get -o DPkg::Lock::Timeout=600)
+  "${APT[@]}" update -q
+  "${APT[@]}" install -yq curl jq openssl ufw nftables fail2ban python3-systemd unattended-upgrades
+  printf 'APT::Periodic::Update-Package-Lists "1";\nAPT::Periodic::Unattended-Upgrade "1";\n' \
+    > /etc/apt/apt.conf.d/20auto-upgrades
+else
+  # fail2ban 在 EPEL；RHEL 本体没有 epel-release 包，需先按 EPEL 官方文档启用
+  dnf install -y epel-release || rpm -q epel-release >/dev/null || die "无法启用 EPEL"
+  # 不装 curl：最小化镜像自带 curl-minimal，装 curl 会冲突；fail2ban 元包会拉进 sendmail，只装 server
+  dnf install -y jq openssl firewalld nftables fail2ban-server python3-systemd dnf-automatic
+  sed -i -E 's/^upgrade_type\s*=.*/upgrade_type = security/; s/^apply_updates\s*=.*/apply_updates = yes/' /etc/dnf/automatic.conf
+  systemctl enable --now dnf-automatic.timer
+fi
 
 echo "== 3/7 安装 xray（官方 XTLS/Xray-install，服务以专用用户 xray 运行）"
 installer=$(curl -fsSL https://github.com/XTLS/Xray-install/raw/main/install-release.sh) \
-  || { echo "下载 Xray 官方安装脚本失败" >&2; exit 1; }
+  || die "下载 Xray 官方安装脚本失败"
 bash -c "$installer" @ install
 
 echo "== 4/7 生成配置"
@@ -45,7 +65,7 @@ if [[ -n $old_in ]]; then
   SID=$(jq -r '.streamSettings.realitySettings.shortIds[0] // empty' <<<"$old_in")
   PORT=$(jq -r '.port' <<<"$old_in")
   SNI=$(jq -r '.streamSettings.realitySettings.serverNames[0] // empty' <<<"$old_in")
-  [[ -n $UUID && -n $PRIV && -n $SID && -n $SNI ]] || { echo "$CFG 里的旧入站不完整，请手动处理" >&2; exit 1; }
+  [[ -n $UUID && -n $PRIV && -n $SID && -n $SNI ]] || die "$CFG 里的旧入站不完整，请手动处理"
 else
   UUID=$($XRAY uuid)
   PRIV=$($XRAY x25519 | awk -F': ' 'NR==1{print $2}')
@@ -78,28 +98,40 @@ systemctl restart xray
 sleep 1; systemctl is-active xray
 
 echo "== 5/7 防火墙"
-for p in $(sshd -T | awk '/^port /{print $2}'); do ufw allow "$p/tcp" >/dev/null; done
-ufw allow "$PORT/tcp" >/dev/null
-ufw --force enable
+SSH_PORTS=$(sshd -T | awk '/^port /{print $2}')
+if [[ $OS == deb ]]; then
+  for p in $SSH_PORTS $PORT; do ufw allow "$p/tcp" >/dev/null; done
+  ufw --force enable
+else
+  systemctl enable --now firewalld
+  for p in $SSH_PORTS $PORT; do firewall-cmd -q --permanent --add-port="$p/tcp"; done
+  firewall-cmd -q --reload
+fi
 
 echo "== 6/7 SSH 与 fail2ban"
+# Debian/Ubuntu 的单元叫 ssh.service，RHEL 系叫 sshd.service；fail2ban 按单元名匹配日志
+if systemctl cat ssh.service >/dev/null 2>&1; then SSH_UNIT=ssh.service; else SSH_UNIT=sshd.service; fi
 # 没有公钥就禁密码登录会把自己锁在外面，所以只在已放公钥时才改
 if ssh-keygen -lf /root/.ssh/authorized_keys >/dev/null 2>&1; then
-  # 排在 50-cloud-init.conf 之前，sshd 对同一项取首个值
+  # 排在 50-cloud-init.conf 之前，sshd 对同一项取首个值；ChallengeResponse 写法新旧 OpenSSH 都认
   keyonly=/etc/ssh/sshd_config.d/00-key-only.conf
+  mkdir -p /etc/ssh/sshd_config.d
   cat > "$keyonly" <<'EOF'
 PasswordAuthentication no
-KbdInteractiveAuthentication no
+ChallengeResponseAuthentication no
 PermitRootLogin prohibit-password
 EOF
   # 配置坏了不能留着，否则下次重启 sshd 起不来
-  sshd -t || { rm -f "$keyonly"; echo "sshd 配置检查失败，已撤回" >&2; exit 1; }
-  systemctl reload ssh
+  sshd -t || { rm -f "$keyonly"; die "sshd 配置检查失败，已撤回"; }
+  systemctl try-reload-or-restart "$SSH_UNIT"
+  sshd -T | grep -qx 'passwordauthentication no' \
+    || echo "警告：sshd_config 没有 Include sshd_config.d（如 RHEL 8），密码登录仍开着，请手动设 PasswordAuthentication no" >&2
 else
   echo "/root/.ssh/authorized_keys 里没有有效公钥，保留密码登录（放好公钥后重跑本脚本即改为仅密钥）"
 fi
 
-IP=$(curl -fsS4 --max-time 10 https://api.ipify.org || hostname -I | awk '{print $1}')
+IP=$(curl -fsS4 --max-time 10 https://api.ipify.org \
+  || ip -4 route get 1.1.1.1 | awk '{for (i = 1; i < NF; i++) if ($i == "src") print $(i + 1)}')
 # 经本出口登录 SSH 时来源 IP 就是本机公网 IP，别把自己封了
 cat > /etc/fail2ban/jail.d/10-ignore-self.local <<EOF
 [DEFAULT]
@@ -107,12 +139,12 @@ ignoreip = 127.0.0.1/8 ::1 $IP $EXTRA_IGNORE
 banaction = nftables
 banaction_allports = nftables[type=allports]
 
-# Debian 的 sshd 单元叫 ssh.service，fail2ban 默认按 sshd.service 匹配日志会漏掉
 [sshd]
 enabled = true
 backend = systemd
-journalmatch = _SYSTEMD_UNIT=ssh.service + _COMM=sshd
+journalmatch = _SYSTEMD_UNIT=$SSH_UNIT + _COMM=sshd
 EOF
+systemctl enable fail2ban >/dev/null 2>&1
 systemctl restart fail2ban
 
 echo "== 7/7 BBR"
@@ -122,6 +154,9 @@ if [[ $(sysctl -n net.ipv4.tcp_congestion_control) != bbr ]]; then
 fi
 sysctl -n net.ipv4.tcp_congestion_control
 
+# v2rayN / v2rayNG / Shadowrocket 等通用的 VLESS 分享链接格式；备注要 URL 编码
+NAME=$(jq -rn --arg n "reality-$IP" '$n | @uri')
+LINK="vless://$UUID@$IP:$PORT?encryption=none&flow=xtls-rprx-vision&security=reality&sni=$SNI&fp=chrome&pbk=$PUB&sid=$SID&type=tcp&headerType=none#$NAME"
 out=/root/xray-client.txt
 cat > "$out" <<EOF
 地址      $IP
@@ -132,7 +167,14 @@ SNI       $SNI
 公钥 pbk  $PUB
 shortId   $SID
 fp        chrome
-链接      vless://$UUID@$IP:$PORT?encryption=none&flow=xtls-rprx-vision&security=reality&sni=$SNI&fp=chrome&pbk=$PUB&sid=$SID&type=tcp#$IP
+
+$LINK
 EOF
 chmod 600 "$out"
-echo; cat "$out"; echo; echo "已保存到 $out"
+cat <<EOF
+
+客户端参数已保存到 $out（最后一行是导入链接，可用 tail -1 $out 再次查看）
+
+==== v2rayN 导入：复制下面整行，在 v2rayN 主界面按 Ctrl+V（或「服务器 → 从剪贴板导入分享链接」）====
+$LINK
+EOF
