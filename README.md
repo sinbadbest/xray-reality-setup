@@ -28,16 +28,20 @@ PORT=36703 EXTRA_IGNORE="1.2.3.4" bash <(curl -Ls https://raw.githubusercontent.
 
 1. 内存不足 2 GB 且没有 swap 时建 2 GB swapfile
 2. 安装 ufw、fail2ban、unattended-upgrades（自动安全更新）
-3. 用官方 [XTLS/Xray-install](https://github.com/XTLS/Xray-install) 安装 Xray，服务以 `nobody` 运行
+3. 用官方 [XTLS/Xray-install](https://github.com/XTLS/Xray-install) 安装 Xray，服务以专用用户 `xray` 运行，配置文件 640 只给 `xray` 组读
 4. 生成 UUID、x25519 密钥、shortId 并写入 `/usr/local/etc/xray/config.json`：
    - 不记访问日志
    - 屏蔽 BT 和内网地址，不屏蔽国内 IP
    - 只接受指定 SNI 和 shortId（不接受空值）
 5. ufw 只放行 SSH 端口和 Xray 端口
-6. 已放 `/root/.ssh/authorized_keys` 时改为仅密钥登录，否则保留密码登录；fail2ban 保护 sshd，并把本机公网 IP 加入白名单
+6. `/root/.ssh/authorized_keys` 里有有效公钥时改为仅密钥登录，否则保留密码登录；fail2ban 保护 sshd，并把本机公网 IP 加入白名单
 7. 未启用 BBR 时启用
 
-重复运行安全：已有配置时沿用原 UUID、密钥、shortId 和端口。
+重复运行安全：已有配置时沿用原 UUID、密钥、shortId、端口和 SNI（此时传入的 `PORT`/`SNI` 不生效）。放好公钥后重跑一次即可关闭密码登录。
+
+## 许可证
+
+[MIT](LICENSE)
 
 ## 常用命令
 

@@ -13,6 +13,7 @@ XRAY=/usr/local/bin/xray
 
 [[ $EUID -eq 0 ]] || { echo "请用 root 运行" >&2; exit 1; }
 grep -qi debian /etc/os-release || { echo "仅支持 Debian" >&2; exit 1; }
+if ! [[ $PORT =~ ^[0-9]+$ ]] || (( PORT < 1 || PORT > 65535 )); then echo "PORT 无效：$PORT" >&2; exit 1; fi
 
 echo "== 1/7 swap"
 if [[ -z $(swapon --show) ]] && (( $(awk '/MemTotal/{print $2}' /proc/meminfo) < 2000000 )); then
@@ -22,23 +23,29 @@ fi
 
 echo "== 2/7 软件包"
 export DEBIAN_FRONTEND=noninteractive
-apt-get update -q
-apt-get install -yq curl jq openssl ufw fail2ban unattended-upgrades
+# 新开机器的 unattended-upgrades 常占着 dpkg 锁，等它而不是直接失败
+APT=(apt-get -o DPkg::Lock::Timeout=600)
+"${APT[@]}" update -q
+"${APT[@]}" install -yq curl jq openssl ufw fail2ban python3-systemd unattended-upgrades
 printf 'APT::Periodic::Update-Package-Lists "1";\nAPT::Periodic::Unattended-Upgrade "1";\n' \
   > /etc/apt/apt.conf.d/20auto-upgrades
 
-echo "== 3/7 安装 xray（官方 XTLS/Xray-install，服务以 nobody 运行）"
-bash -c "$(curl -fsSL https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install
+echo "== 3/7 安装 xray（官方 XTLS/Xray-install，服务以专用用户 xray 运行）"
+installer=$(curl -fsSL https://github.com/XTLS/Xray-install/raw/main/install-release.sh) \
+  || { echo "下载 Xray 官方安装脚本失败" >&2; exit 1; }
+bash -c "$installer" @ install
 
 echo "== 4/7 生成配置"
-old_in=$(jq -c '.inbounds[]? | select(.protocol == "vless")' "$CFG" 2>/dev/null || true)
+old_in=$(jq -c 'first(.inbounds[]? | select(.protocol == "vless" and .streamSettings.security == "reality"))' \
+  "$CFG" 2>/dev/null || true)
 if [[ -n $old_in ]]; then
-  echo "沿用已有凭据"
-  UUID=$(jq -r '.settings.clients[0].id' <<<"$old_in")
-  PRIV=$(jq -r '.streamSettings.realitySettings.privateKey' <<<"$old_in")
-  SID=$(jq -r '.streamSettings.realitySettings.shortIds[0]' <<<"$old_in")
+  echo "沿用已有凭据（忽略本次传入的 PORT/SNI）"
+  UUID=$(jq -r '.settings.clients[0].id // empty' <<<"$old_in")
+  PRIV=$(jq -r '.streamSettings.realitySettings.privateKey // empty' <<<"$old_in")
+  SID=$(jq -r '.streamSettings.realitySettings.shortIds[0] // empty' <<<"$old_in")
   PORT=$(jq -r '.port' <<<"$old_in")
-  SNI=$(jq -r '.streamSettings.realitySettings.serverNames[0]' <<<"$old_in")
+  SNI=$(jq -r '.streamSettings.realitySettings.serverNames[0] // empty' <<<"$old_in")
+  [[ -n $UUID && -n $PRIV && -n $SID && -n $SNI ]] || { echo "$CFG 里的旧入站不完整，请手动处理" >&2; exit 1; }
 else
   UUID=$($XRAY uuid)
   PRIV=$($XRAY x25519 | awk -F': ' 'NR==1{print $2}')
@@ -48,6 +55,7 @@ fi
 PUB=$($XRAY x25519 -i "$PRIV" | awk -F': ' 'NR==2{print $2}')
 
 tmp=$(mktemp --suffix=.json)   # xray 靠扩展名识别配置格式
+trap 'rm -f "$tmp"' EXIT        # 含私钥，失败退出也要删
 jq -n --arg uuid "$UUID" --arg priv "$PRIV" --arg sid "$SID" --arg sni "$SNI" --argjson port "$PORT" '{
   log: {access: "none", error: "/var/log/xray/error.log", loglevel: "warning"},
   routing: {domainStrategy: "IPIfNonMatch", rules: [
@@ -64,29 +72,31 @@ jq -n --arg uuid "$UUID" --arg priv "$PRIV" --arg sid "$SID" --arg sni "$SNI" --
   outbounds: [{tag: "direct", protocol: "freedom"}, {tag: "block", protocol: "blackhole"}]
 }' > "$tmp"
 $XRAY run -test -config "$tmp" | tail -1
-install -m 0644 "$tmp" "$CFG" && rm -f "$tmp"
+install -m 640 -o 0 -g xray "$tmp" "$CFG"   # 与官方安装脚本一致：含私钥，只给 xray 组读
 systemctl enable xray >/dev/null 2>&1
 systemctl restart xray
 sleep 1; systemctl is-active xray
 
 echo "== 5/7 防火墙"
-SSH_PORT=$(sshd -T | awk '/^port /{p=$2} END{print p}')
-ufw allow "$SSH_PORT/tcp" >/dev/null
+for p in $(sshd -T | awk '/^port /{print $2}'); do ufw allow "$p/tcp" >/dev/null; done
 ufw allow "$PORT/tcp" >/dev/null
 ufw --force enable
 
 echo "== 6/7 SSH 与 fail2ban"
 # 没有公钥就禁密码登录会把自己锁在外面，所以只在已放公钥时才改
-if [[ -s /root/.ssh/authorized_keys ]]; then
+if ssh-keygen -lf /root/.ssh/authorized_keys >/dev/null 2>&1; then
   # 排在 50-cloud-init.conf 之前，sshd 对同一项取首个值
-  cat > /etc/ssh/sshd_config.d/00-key-only.conf <<'EOF'
+  keyonly=/etc/ssh/sshd_config.d/00-key-only.conf
+  cat > "$keyonly" <<'EOF'
 PasswordAuthentication no
 KbdInteractiveAuthentication no
 PermitRootLogin prohibit-password
 EOF
-  sshd -t && systemctl reload ssh
+  # 配置坏了不能留着，否则下次重启 sshd 起不来
+  sshd -t || { rm -f "$keyonly"; echo "sshd 配置检查失败，已撤回" >&2; exit 1; }
+  systemctl reload ssh
 else
-  echo "未找到 /root/.ssh/authorized_keys，保留密码登录（放好公钥后重跑本脚本即改为仅密钥）"
+  echo "/root/.ssh/authorized_keys 里没有有效公钥，保留密码登录（放好公钥后重跑本脚本即改为仅密钥）"
 fi
 
 IP=$(curl -fsS4 --max-time 10 https://api.ipify.org || hostname -I | awk '{print $1}')
@@ -97,9 +107,11 @@ ignoreip = 127.0.0.1/8 ::1 $IP $EXTRA_IGNORE
 banaction = nftables
 banaction_allports = nftables[type=allports]
 
+# Debian 的 sshd 单元叫 ssh.service，fail2ban 默认按 sshd.service 匹配日志会漏掉
 [sshd]
 enabled = true
 backend = systemd
+journalmatch = _SYSTEMD_UNIT=ssh.service + _COMM=sshd
 EOF
 systemctl restart fail2ban
 
