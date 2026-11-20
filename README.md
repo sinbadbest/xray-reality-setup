@@ -65,3 +65,14 @@ systemctl status xray
 cat /root/xray-client.txt
 xray run -test -config /usr/local/etc/xray/config.json
 ```
+
+## 回归测试
+
+需要 Python 3 和 Bash，在仓库根目录运行：
+
+```bash
+python3 -m unittest discover -s tests -v
+bash -n install.sh
+```
+
+测试使用隔离目录和命令替身，模拟首次创建日志、修复 root 所有的日志、重复运行、启动失败诊断及无效配置；不会安装软件、访问网络或操作真实服务。日志属主通过标记模拟，不替代真实 Linux 安装验证。

@@ -91,11 +91,23 @@ jq -n --arg uuid "$UUID" --arg priv "$PRIV" --arg sid "$SID" --arg sni "$SNI" --
   }],
   outbounds: [{tag: "direct", protocol: "freedom"}, {tag: "block", protocol: "blackhole"}]
 }' > "$tmp"
+# root 执行配置检查时也会打开日志；先设置属主，避免生成 root 所有的日志后服务无法写入。
+# touch 保留已有日志内容；重复运行也能修复之前失败安装留下的日志权限。
+install -d -m 750 -o xray -g xray /var/log/xray
+touch /var/log/xray/error.log
+chown xray:xray /var/log/xray/error.log
+chmod 640 /var/log/xray/error.log
 $XRAY run -test -config "$tmp" | tail -1
 install -m 640 -o 0 -g xray "$tmp" "$CFG"   # 与官方安装脚本一致：含私钥，只给 xray 组读
 systemctl enable xray >/dev/null 2>&1
-systemctl restart xray
-sleep 1; systemctl is-active xray
+xray_start_failed() {
+  systemctl status xray --no-pager -l >&2 || true
+  journalctl -u xray -b -n 50 --no-pager >&2 || true
+  die "Xray 启动失败，请检查上方日志（常见原因：日志权限或端口占用）"
+}
+systemctl restart xray || xray_start_failed
+sleep 1
+systemctl is-active xray || xray_start_failed
 
 echo "== 5/7 防火墙"
 SSH_PORTS=$(sshd -T | awk '/^port /{print $2}')
